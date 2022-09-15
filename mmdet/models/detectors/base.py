@@ -10,6 +10,8 @@ from mmcv.runner import BaseModule, auto_fp16
 
 from mmdet.core.visualization import imshow_det_bboxes
 
+import sys
+
 
 class BaseDetector(BaseModule, metaclass=ABCMeta):
     """Base class for detectors."""

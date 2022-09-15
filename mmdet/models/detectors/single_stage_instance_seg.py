@@ -10,6 +10,8 @@ from mmdet.core.visualization.image import imshow_det_bboxes
 from ..builder import DETECTORS, build_backbone, build_head, build_neck
 from .base import BaseDetector
 
+import sys
+
 INF = 1e8
 
 
@@ -139,7 +141,7 @@ class SingleStageInstanceSegmentor(BaseDetector):
         losses.update(mask_loss)
         return losses
 
-    def simple_test(self, img, img_metas, rescale=False):
+    def simple_test(self, img, img_metas, gt_bboxes, gt_labels, gt_masks, rescale=False):
         """Test function without test-time augmentation.
 
         Args:
@@ -163,6 +165,12 @@ class SingleStageInstanceSegmentor(BaseDetector):
                   each ndarray has a shape (N, img_h, img_w), N
                   is the number of masks with this category.
         """
+        # prepare mask for confusion matrix
+        gt_masks = [
+            gt_mask.to_tensor(dtype=torch.bool, device=img.device)
+            for gt_mask in gt_masks[0]
+        ]
+
         feat = self.extract_feat(img)
         if self.bbox_head:
             outs = self.bbox_head(feat)

@@ -14,6 +14,8 @@ from mmdet.core.utils import center_of_mass, generate_coordinate
 from mmdet.models.builder import HEADS
 from .solo_head import SOLOHead
 
+import sys
+
 
 class MaskFeatModule(BaseModule):
     """SOLOv2 mask feature map branch used in `SOLOv2: Dynamic and Fast
@@ -250,7 +252,9 @@ class SOLOV2Head(SOLOHead):
     @auto_fp16()
     def forward(self, feats):
         assert len(feats) == self.num_levels
+        # mask_feats: output of feature branch
         mask_feats = self.mask_feature_head(feats)
+        # resize_feats: downsample first feat and upsample last feat
         feats = self.resize_feats(feats)
         mlvl_kernel_preds = []
         mlvl_cls_preds = []
@@ -286,6 +290,23 @@ class SOLOV2Head(SOLOHead):
             mlvl_kernel_preds.append(kernel_pred)
             mlvl_cls_preds.append(cate_pred)
 
+        """
+            Outputs of this function
+            * mlvl_kernel_preds 
+                [1, 128, 40, 40]
+                [1, 128, 36, 36]
+                [1, 128, 24, 24]
+                [1, 128, 16, 16]
+                [1, 128, 12, 12]
+            * mlvl_cls_preds
+                [1, 80, 40, 40]
+                [1, 80, 36, 36]
+                [1, 80, 24, 24]
+                [1, 80, 16, 16]
+                [1, 80, 12, 12]
+            * mask_feats
+                [1, 128, 112, 168] : depend on input shape
+        """ 
         return mlvl_kernel_preds, mlvl_cls_preds, mask_feats
 
     def _get_targets_single(self,
@@ -653,6 +674,13 @@ class SOLOV2Head(SOLOHead):
                 - labels (Tensor): Has shape (num_instances,).
                 - masks (Tensor): Processed mask results, has
                   shape (num_instances, h, w).
+        """
+        """
+            Input shape
+            * kernel_preds
+                [3872, 128]
+            * cls_scores
+                [3872, 80]
         """
 
         def empty_results(results, cls_scores):

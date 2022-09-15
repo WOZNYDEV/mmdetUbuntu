@@ -109,6 +109,13 @@ class BaseMaskHead(BaseModule, metaclass=ABCMeta):
             rescale=rescale,
             instances_list=instances_list,
             **kwargs)
+        """
+            Default outputs
+            * 最大100枚のマスクとそれと対応するカテゴリラベルとカテゴリスコア
+                [100, 427, 640] : 入力画像サイズに依存
+                [100]
+                [100]
+        """
         return results_list
 
     def onnx_export(self, img, img_metas):
