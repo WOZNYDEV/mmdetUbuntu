@@ -73,6 +73,9 @@ class BaseMaskHead(BaseModule, metaclass=ABCMeta):
     def simple_test(self,
                     feats,
                     img_metas,
+                    gt_masks,
+                    gt_labels,
+                    gt_bboxes,
                     rescale=False,
                     instances_list=None,
                     **kwargs):
@@ -104,11 +107,23 @@ class BaseMaskHead(BaseModule, metaclass=ABCMeta):
         else:
             outs = self(feats, instances_list=instances_list)
         mask_inputs = outs + (img_metas, )
+
+        results_list_for_confusion = self.gridwise_result(
+            *outs,
+            gt_labels=gt_labels,
+            gt_masks=gt_masks,
+            img_metas=img_metas,
+            gt_bboxes=gt_bboxes,
+            gt_bboxes_ignore=None,
+            positive_infos=None,
+            **kwargs)
+
         results_list = self.get_results(
             *mask_inputs,
             rescale=rescale,
             instances_list=instances_list,
             **kwargs)
+        
         """
             Default outputs
             * 最大100枚のマスクとそれと対応するカテゴリラベルとカテゴリスコア
@@ -116,7 +131,7 @@ class BaseMaskHead(BaseModule, metaclass=ABCMeta):
                 [100]
                 [100]
         """
-        return results_list
+        return results_list, results_list_for_confusion
 
     def onnx_export(self, img, img_metas):
         raise NotImplementedError(f'{self.__class__.__name__} does '

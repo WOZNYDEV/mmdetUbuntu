@@ -5,6 +5,8 @@ import shutil
 import tempfile
 import time
 
+import json
+
 import mmcv
 import torch
 import torch.distributed as dist
@@ -24,9 +26,13 @@ def single_gpu_test(model,
     dataset = data_loader.dataset
     PALETTE = getattr(dataset, 'PALETTE', None)
     prog_bar = mmcv.ProgressBar(len(dataset))
+    return_dic = {}
     for i, data in enumerate(data_loader):
         with torch.no_grad():
-            result = model(return_loss=False, rescale=True, **data)
+            result, result_for_confusion = model(return_loss=False, rescale=True, **data)
+            filename = data['img_metas'][0].data[0][0]['filename']
+            filename = filename.split('/')[-1].split('.')[0]
+            return_dic[filename] = result_for_confusion
 
         batch_size = len(result)
         if show or out_dir:
@@ -75,6 +81,10 @@ def single_gpu_test(model,
 
         for _ in range(batch_size):
             prog_bar.update()
+    
+    with open('/mmdetection/data/tmp/gridwise_result.json', 'w') as f:
+        json.dump(return_dic, f)
+
     return results
 
 

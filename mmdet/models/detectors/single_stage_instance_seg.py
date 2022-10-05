@@ -180,14 +180,14 @@ class SingleStageInstanceSegmentor(BaseDetector):
         else:
             results_list = None
 
-        results_list = self.mask_head.simple_test(
-            feat, img_metas, rescale=rescale, instances_list=results_list)
+        results_list, results_list_for_confusion = self.mask_head.simple_test(
+            feat, img_metas, rescale=rescale, instances_list=results_list, gt_masks=gt_masks, gt_labels=gt_labels, gt_bboxes=gt_bboxes)
 
         format_results_list = []
         for results in results_list:
             format_results_list.append(self.format_results(results))
 
-        return format_results_list
+        return format_results_list, results_list_for_confusion
 
     def format_results(self, results):
         """Format the model predictions according to the interface with

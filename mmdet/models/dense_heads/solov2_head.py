@@ -462,6 +462,392 @@ class SOLOV2Head(SOLOHead):
         return (mlvl_pos_mask_targets, mlvl_labels, mlvl_pos_masks,
                 mlvl_pos_indexes)
 
+    def _get_targets_single_for_confusion(self,
+                            gt_bboxes,
+                            gt_labels,
+                            gt_masks,
+                            featmap_size=None):
+        """Compute targets for predictions of single image.
+
+        Args:
+            gt_bboxes (Tensor): Ground truth bbox of each instance,
+                shape (num_gts, 4).
+            gt_labels (Tensor): Ground truth label of each instance,
+                shape (num_gts,).
+            gt_masks (Tensor): Ground truth mask of each instance,
+                shape (num_gts, h, w).
+            featmap_sizes (:obj:`torch.size`): Size of UNified mask
+                feature map used to generate instance segmentation
+                masks by dynamic convolution, each element means
+                (feat_h, feat_w). Default: None.
+
+        Returns:
+            Tuple: Usually returns a tuple containing targets for predictions.
+
+                - mlvl_pos_mask_targets (list[Tensor]): Each element represent
+                  the binary mask targets for positive points in this
+                  level, has shape (num_pos, out_h, out_w).
+                - mlvl_labels (list[Tensor]): Each element is
+                  classification labels for all
+                  points in this level, has shape
+                  (num_grid, num_grid).
+                - mlvl_pos_masks  (list[Tensor]): Each element is
+                  a `BoolTensor` to represent whether the
+                  corresponding point in single level
+                  is positive, has shape (num_grid **2).
+                - mlvl_pos_indexes  (list[list]): Each element
+                  in the list contains the positive index in
+                  corresponding level, has shape (num_pos).
+        """
+
+        device = gt_labels.device
+        gt_areas = torch.sqrt((gt_bboxes[:, 2] - gt_bboxes[:, 0]) *
+                              (gt_bboxes[:, 3] - gt_bboxes[:, 1]))
+
+        mlvl_pos_mask_targets = []
+        mlvl_pos_indexes = []
+        mlvl_labels = []
+        mlvl_pos_masks = []
+        for (lower_bound, upper_bound), num_grid \
+                in zip(self.scale_ranges, self.num_grids):
+            mask_target = []
+            # FG cat_id: [0, num_classes -1], BG cat_id: num_classes
+            pos_index = []
+            labels = torch.zeros([num_grid, num_grid],
+                                 dtype=torch.int64,
+                                 device=device) + self.num_classes
+            pos_mask = torch.zeros([num_grid**2],
+                                   dtype=torch.bool,
+                                   device=device)
+
+            gt_inds = ((gt_areas >= lower_bound) &
+                       (gt_areas <= upper_bound)).nonzero().flatten()
+            if len(gt_inds) == 0:
+                mlvl_pos_mask_targets.append(
+                    torch.zeros([0, featmap_size[0], featmap_size[1]],
+                                dtype=torch.uint8,
+                                device=device))
+                mlvl_labels.append(labels)
+                mlvl_pos_masks.append(pos_mask)
+                mlvl_pos_indexes.append([])
+                continue
+            hit_gt_bboxes = gt_bboxes[gt_inds]
+            hit_gt_labels = gt_labels[gt_inds]
+            hit_gt_masks = gt_masks[gt_inds, ...]
+
+            pos_w_ranges = 0.5 * (hit_gt_bboxes[:, 2] -
+                                  hit_gt_bboxes[:, 0]) * self.pos_scale
+            pos_h_ranges = 0.5 * (hit_gt_bboxes[:, 3] -
+                                  hit_gt_bboxes[:, 1]) * self.pos_scale
+
+            # Make sure hit_gt_masks has a value
+            valid_mask_flags = hit_gt_masks.sum(dim=-1).sum(dim=-1) > 0
+
+            for gt_mask, gt_label, pos_h_range, pos_w_range, \
+                valid_mask_flag in \
+                    zip(hit_gt_masks, hit_gt_labels, pos_h_ranges,
+                        pos_w_ranges, valid_mask_flags):
+                if not valid_mask_flag:
+                    continue
+                upsampled_size = (featmap_size[0] * self.mask_stride,
+                                  featmap_size[1] * self.mask_stride)
+                center_h, center_w = center_of_mass(gt_mask)
+
+                coord_w = int(
+                    (center_w / upsampled_size[1]) // (1. / num_grid))
+                coord_h = int(
+                    (center_h / upsampled_size[0]) // (1. / num_grid))
+
+                # left, top, right, down
+                top_box = max(
+                    0,
+                    int(((center_h - pos_h_range) / upsampled_size[0]) //
+                        (1. / num_grid)))
+                down_box = min(
+                    num_grid - 1,
+                    int(((center_h + pos_h_range) / upsampled_size[0]) //
+                        (1. / num_grid)))
+                left_box = max(
+                    0,
+                    int(((center_w - pos_w_range) / upsampled_size[1]) //
+                        (1. / num_grid)))
+                right_box = min(
+                    num_grid - 1,
+                    int(((center_w + pos_w_range) / upsampled_size[1]) //
+                        (1. / num_grid)))
+
+                top = max(top_box, coord_h - 1)
+                down = min(down_box, coord_h + 1)
+                left = max(coord_w - 1, left_box)
+                right = min(right_box, coord_w + 1)
+
+                labels[top:(down + 1), left:(right + 1)] = gt_label
+                # ins
+                gt_mask = np.uint8(gt_mask.cpu().numpy())
+                # Follow the original implementation, F.interpolate is
+                # different from cv2 and opencv
+                gt_mask = mmcv.imrescale(gt_mask, scale=1. / self.mask_stride)
+                gt_mask = torch.from_numpy(gt_mask).to(device=device)
+
+                for i in range(top, down + 1):
+                    for j in range(left, right + 1):
+                        index = int(i * num_grid + j)
+                        this_mask_target = torch.zeros(
+                            [featmap_size[0], featmap_size[1]],
+                            dtype=torch.uint8,
+                            device=device)
+                        this_mask_target[:gt_mask.shape[0], :gt_mask.
+                                         shape[1]] = gt_mask
+                        mask_target.append(this_mask_target)
+                        pos_mask[index] = True
+                        pos_index.append(index)
+            if len(mask_target) == 0:
+                mask_target = torch.zeros(
+                    [0, featmap_size[0], featmap_size[1]],
+                    dtype=torch.uint8,
+                    device=device)
+            else:
+                mask_target = torch.stack(mask_target, 0)
+            mlvl_pos_mask_targets.append(mask_target)
+            mlvl_labels.append(labels)
+            mlvl_pos_masks.append(pos_mask)
+            mlvl_pos_indexes.append(pos_index)
+        return (mlvl_pos_mask_targets, mlvl_labels, mlvl_pos_masks,
+                mlvl_pos_indexes)
+
+    # Confusion Matrixを出すための関数
+    def gridwise_result(self,
+             mlvl_kernel_preds,
+             mlvl_cls_preds,
+             mask_feats,
+             gt_labels,
+             gt_masks,
+             img_metas,
+             gt_bboxes=None,
+             **kwargs):
+        """Calculate the loss of total batch.
+
+        Args:
+            mlvl_kernel_preds (list[Tensor]): Multi-level dynamic kernel
+                prediction. The kernel is used to generate instance
+                segmentation masks by dynamic convolution. Each element in the
+                list has shape
+                (batch_size, kernel_out_channels, num_grids, num_grids).
+            mlvl_cls_preds (list[Tensor]): Multi-level scores. Each element
+                in the list has shape
+                (batch_size, num_classes, num_grids, num_grids).
+            mask_feats (Tensor): Unified mask feature map used to generate
+                instance segmentation masks by dynamic convolution. Has shape
+                (batch_size, mask_out_channels, h, w).
+            gt_labels (list[Tensor]): Labels of multiple images.
+            gt_masks (list[Tensor]): Ground truth masks of multiple images.
+                Each has shape (num_instances, h, w).
+            img_metas (list[dict]): Meta information of multiple images.
+            gt_bboxes (list[Tensor]): Ground truth bboxes of multiple
+                images. Default: None.
+
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components.
+        """
+        featmap_size = mask_feats.size()[-2:]
+        # print('*'*30, ' gt_labels ', '*'*30)
+        # print(gt_bboxes)
+        # import sys
+        # sys.exit(0)
+
+        # アノテーションデータをグリッド単位に変換
+        pos_mask_targets, labels, pos_masks, pos_indexes = multi_apply(
+            self._get_targets_single_for_confusion,
+            gt_bboxes[0],
+            gt_labels[0],
+            gt_masks,
+            featmap_size=featmap_size)
+        # print('*'*30, ' pos_mask_targets ', '*'*30)
+        # for pos_mask_target in pos_mask_targets:
+        #     for data in pos_mask_target:
+        #         print(data.shape)
+        # print('*'*30, ' labels ', '*'*30)
+        # for label in labels:
+        #     for data in label:
+        #         print(data.shape)
+        # print('*'*30, ' pos_masks ', '*'*30)
+        # for pos_mask in pos_masks:
+        #     for data in pos_mask:
+        #         print(data.shape)
+        #         print(torch.count_nonzero(data))
+            
+        # print('*'*30, ' pos_indexes ', '*'*30)
+        # for pos_index in pos_indexes:
+        #     for data in pos_index:
+        #         print(len(data), ' : ', data)
+
+        mlvl_mask_targets = [
+            torch.cat(lvl_mask_targets, 0)
+            for lvl_mask_targets in zip(*pos_mask_targets)
+        ]
+        # print('*'*30, ' mlvl_mask_targets ', '*'*30)
+        # for mlvl_mask_target in mlvl_mask_targets:
+        #     print(mlvl_mask_target.shape)
+        # print(mlvl_mask_targets[0][0])
+        # print(torch.count_nonzero(mlvl_mask_targets[0][0]))
+        tmp_all_indexes = []
+        all_indexes = []
+        for num_grid in [40, 36, 24, 16, 12]:
+            tmp_all_indexes.append([x for x in range(num_grid*num_grid)])
+        all_indexes.append(tmp_all_indexes) 
+
+        mlvl_pos_kernel_preds = []
+        # print('*'*30, ' pos_indexes ', '*'*30)
+        # print(pos_indexes)
+        # print('*'*30, ' all_indexes ', '*'*30)
+        # print(all_indexes)
+        # for lvl_kernel_preds, lvl_pos_indexes in zip(mlvl_kernel_preds,
+        #                                              zip(*pos_indexes)):
+        for lvl_kernel_preds, lvl_pos_indexes in zip(mlvl_kernel_preds,
+                                                     zip(*all_indexes)):
+            # print('*'*30, ' lvl_pos_indexes ', '*'*30)
+            # print(lvl_pos_indexes)
+            lvl_pos_kernel_preds = []
+            for img_lvl_kernel_preds, img_lvl_pos_indexes in zip(
+                    lvl_kernel_preds, lvl_pos_indexes):
+                img_lvl_pos_kernel_preds = img_lvl_kernel_preds.view(
+                    img_lvl_kernel_preds.shape[0], -1)[:, img_lvl_pos_indexes]
+                lvl_pos_kernel_preds.append(img_lvl_pos_kernel_preds)
+            mlvl_pos_kernel_preds.append(lvl_pos_kernel_preds)
+        # print('*'*30, ' mlvl_pos_kernel_preds ', '*'*30)
+        # for mlvl_pos_kernel_pred in mlvl_pos_kernel_preds:
+        #     for data in mlvl_pos_kernel_pred:
+        #         print(data.shape)
+
+        # make multilevel mlvl_mask_pred
+        mlvl_mask_preds = []
+        for lvl_pos_kernel_preds in mlvl_pos_kernel_preds:
+            lvl_mask_preds = []
+            for img_id, img_lvl_pos_kernel_pred in enumerate(
+                    lvl_pos_kernel_preds):
+                if img_lvl_pos_kernel_pred.size()[-1] == 0:
+                    continue
+                img_mask_feats = mask_feats[[img_id]]
+                h, w = img_mask_feats.shape[-2:]
+                num_kernel = img_lvl_pos_kernel_pred.shape[1]
+                img_lvl_mask_pred = F.conv2d(
+                    img_mask_feats,
+                    img_lvl_pos_kernel_pred.permute(1, 0).view(
+                        num_kernel, -1, self.dynamic_conv_size,
+                        self.dynamic_conv_size),
+                    stride=1).view(-1, h, w)
+                lvl_mask_preds.append(img_lvl_mask_pred.sigmoid())
+            if len(lvl_mask_preds) == 0:
+                lvl_mask_preds = None
+            else:
+                lvl_mask_preds = torch.cat(lvl_mask_preds, 0)
+            mlvl_mask_preds.append(lvl_mask_preds)
+
+        masks = []
+        for mlvl_mask_pred in mlvl_mask_preds:
+            masks_tmp = mlvl_mask_pred > 0.5
+            masks.append(masks_tmp.to(torch.int8))
+        # print('*'*30, ' masks ', '*'*30)
+        # for mask in masks:
+        #     print(mask.shape)
+        
+        # print('*'*30, ' pos_indexes ', '*'*30)
+        # print(pos_indexes)
+        # print('*'*30, ' in loop ', '*'*30)
+        final_masks = []
+        for mask_tensor, index in zip(masks, pos_indexes[0]):
+            final_masks.append(mask_tensor[index])
+        # print('*'*30, ' final_masks ', '*'*30)
+        # for final_mask in final_masks:
+        #     print(final_mask.shape)
+        # print(masks[0][1014].shape)
+        # print(final_masks[0][0].shape)
+        # print(torch.equal(masks[0][1014], final_masks[0][0]))
+        # print(masks[0][1014])
+        # print(torch.count_nonzero(masks[0][1014]))
+
+        # print('*'*30, ' mlvl_mask_preds ', '*'*30)
+        # for mlvl_mask_pred in mlvl_mask_preds:
+        #     print(mlvl_mask_pred.shape)
+        # print(mlvl_mask_preds[0][0])
+        
+        # [TODO] mlvl_mask_targetsとfinal_masksからマスクのIoUを計算
+        SMOOTH = 1e-6
+        # print('*'*30, ' compute iou ', '*'*30)
+        ious = []
+        for final_mask, mlvl_mask_target in zip(final_masks, mlvl_mask_targets):
+            iou_tmp = []
+            for pred, target in zip(final_mask, mlvl_mask_target):
+                iou = (torch.sum(torch.logical_and(pred, target)).to(torch.float) + SMOOTH) / (torch.sum(torch.logical_or(pred, target)).to(torch.float) + SMOOTH)
+                iou_tmp.append(iou.item())
+            ious.append(iou_tmp)
+        
+        # for iou in ious:
+        #     print(iou)
+
+        # dice loss
+        # num_pos = 0
+        # for img_pos_masks in pos_masks:
+        #     for lvl_img_pos_masks in img_pos_masks:
+        #         num_pos += lvl_img_pos_masks.count_nonzero()
+
+        # loss_mask = []
+        # for lvl_mask_preds, lvl_mask_targets in zip(mlvl_mask_preds,
+        #                                             mlvl_mask_targets):
+        #     if lvl_mask_preds is None:
+        #         continue
+        #     loss_mask.append(
+        #         self.loss_mask(
+        #             lvl_mask_preds,
+        #             lvl_mask_targets,
+        #             reduction_override='none'))
+        # if num_pos > 0:
+        #     loss_mask = torch.cat(loss_mask).sum() / num_pos
+        # else:
+        #     loss_mask = torch.cat(loss_mask).mean()
+
+        # print('*'*30, ' labels ', '*'*30)
+        # for label in labels:
+        #     for data in label:
+        #         print(data.shape)
+
+        # cate
+        flatten_labels = [
+            torch.cat(
+                [img_lvl_labels.flatten() for img_lvl_labels in lvl_labels])
+            for lvl_labels in zip(*labels)
+        ]
+        flatten_labels = torch.cat(flatten_labels)
+        # print('*'*30, ' flatten_label ', '*'*30)
+        # print(flatten_labels.shape)
+
+        flatten_cls_preds = [
+            lvl_cls_preds.permute(0, 2, 3, 1).reshape(-1, self.num_classes)
+            for lvl_cls_preds in mlvl_cls_preds
+        ]
+        flatten_cls_preds = torch.cat(flatten_cls_preds)
+        final_cls = torch.argmax(flatten_cls_preds.sigmoid(), dim=1)
+        # print('*'*30, ' flatten_cls_preds ', '*'*30)
+        # print(final_cls.shape)
+
+        # loss_cls = self.loss_cls(
+        #     flatten_cls_preds, flatten_labels, avg_factor=num_pos + 1)
+        # return dict(loss_mask=loss_mask, loss_cls=loss_cls)
+        # print('*'*30, ' final check ', '*'*30)
+        flatten_labels = flatten_labels.tolist()
+        # print(len(flatten_labels))
+        # print(flatten_labels)
+        final_cls = final_cls.tolist()
+        # print(len(final_cls))
+        # print(final_cls)
+        # print(len(ious))
+        # print(ious)
+        pos_indexes = pos_indexes[0]
+        # print(len(pos_indexes))
+        # print(pos_indexes)
+        # sys.exit(0)
+        return dict(cate_ann=flatten_labels, cate_preds=final_cls, mask_iou=ious, pos_index=pos_indexes)
+
     @force_fp32(apply_to=('mlvl_kernel_preds', 'mlvl_cls_preds', 'mask_feats'))
     def loss(self,
              mlvl_kernel_preds,
@@ -646,6 +1032,164 @@ class SOLOV2Head(SOLOHead):
             result_list.append(result)
         return result_list
 
+    def _get_results_single_for_confusion_matrix(self,
+                            kernel_preds,
+                            cls_scores,
+                            mask_feats,
+                            img_meta,
+                            cfg=None):
+        """Get processed mask related results of single image.
+
+        Args:
+            kernel_preds (Tensor): Dynamic kernel prediction of all points
+                in single image, has shape
+                (num_points, kernel_out_channels).
+            cls_scores (Tensor): Classification score of all points
+                in single image, has shape (num_points, num_classes).
+            mask_preds (Tensor): Mask prediction of all points in
+                single image, has shape (num_points, feat_h, feat_w).
+            img_meta (dict): Meta information of corresponding image.
+            cfg (dict, optional): Config used in test phase.
+                Default: None.
+
+        Returns:
+            :obj:`InstanceData`: Processed results of single image.
+             it usually contains following keys.
+                - scores (Tensor): Classification scores, has shape
+                  (num_instance,).
+                - labels (Tensor): Has shape (num_instances,).
+                - masks (Tensor): Processed mask results, has
+                  shape (num_instances, h, w).
+        """
+        """
+            Input shape
+            * kernel_preds
+                [3872, 128]
+            * cls_scores
+                [3872, 80]
+        """
+
+        def empty_results(results, cls_scores):
+            """Generate a empty results."""
+            results.scores = cls_scores.new_ones(0)
+            results.masks = cls_scores.new_zeros(0, *results.ori_shape[:2])
+            results.labels = cls_scores.new_ones(0)
+            return results
+
+        cfg = self.test_cfg if cfg is None else cfg
+        assert len(kernel_preds) == len(cls_scores)
+        results = InstanceData(img_meta)
+
+        featmap_size = mask_feats.size()[-2:]
+
+        img_shape = results.img_shape
+        ori_shape = results.ori_shape
+
+        # overall info
+        h, w, _ = img_shape
+        upsampled_size = (featmap_size[0] * self.mask_stride,
+                          featmap_size[1] * self.mask_stride)
+
+        # process.
+        # カテゴリスコアが0より閾値未満を削除するための[true or false]のスコアマスクを生成
+        # score_mask = (cls_scores > cfg.score_thr)
+        score_mask = (cls_scores > 0)
+        # スコアマスクをもとに不要なカテゴリスコアを削除
+        cls_scores = cls_scores[score_mask]
+        if len(cls_scores) == 0:
+            return empty_results(results, cls_scores)
+
+        # cate_labels & kernel_preds
+        inds = score_mask.nonzero()
+        cls_labels = inds[:, 1]
+        kernel_preds = kernel_preds[inds[:, 0]]
+
+        # trans vector.
+        lvl_interval = cls_labels.new_tensor(self.num_grids).pow(2).cumsum(0)
+        strides = kernel_preds.new_ones(lvl_interval[-1])
+
+        strides[:lvl_interval[0]] *= self.strides[0]
+        for lvl in range(1, self.num_levels):
+            strides[lvl_interval[lvl -
+                                 1]:lvl_interval[lvl]] *= self.strides[lvl]
+        strides = strides[inds[:, 0]]
+
+        print('*'*30, ' kernel_preds shape ', '*'*30)
+        print(kernel_preds.shape)
+        # new mask encoding
+        kernel_preds = kernel_preds.view(
+            kernel_preds.size(0), -1, self.dynamic_conv_size,
+            self.dynamic_conv_size)
+        print('*'*30, ' kernel_preds shape ', '*'*30)
+        print(kernel_preds.shape)
+        print('*'*30, ' mask_feats shape ', '*'*30)
+        print(mask_feats.shape)
+        import sys
+        sys.exit(0)
+
+        # for start, end in [(0, 1000), (1000, 2000), (2000, 3000), (3000, 3872)]:
+        #     print('*'*30, ' mask_preds shape ', '*'*30)
+        #     print('start: ', start, ', end: ', end)
+        #     mask_preds = F.conv2d(
+        #         mask_feats[start:end], kernel_preds, stride=1).squeeze(0).sigmoid()
+        #     print(mask_preds.shape)
+        # import sys
+        # sys.exit(0)
+
+        # mask encoding.
+        kernel_preds = kernel_preds.view(
+            kernel_preds.size(0), -1, self.dynamic_conv_size,
+            self.dynamic_conv_size)
+        mask_preds = F.conv2d(
+            mask_feats, kernel_preds, stride=1).squeeze(0).sigmoid()
+        # mask.
+        masks = mask_preds > cfg.mask_thr
+        # masks = mask_preds > 0
+        sum_masks = masks.sum((1, 2)).float()
+        keep = sum_masks > strides
+        if keep.sum() == 0:
+            return empty_results(results, cls_scores)
+        masks = masks[keep]
+        mask_preds = mask_preds[keep]
+        sum_masks = sum_masks[keep]
+        cls_scores = cls_scores[keep]
+        cls_labels = cls_labels[keep]
+
+        # maskness.
+        mask_scores = (mask_preds * masks).sum((1, 2)) / sum_masks
+        cls_scores *= mask_scores
+
+        scores, labels, _, keep_inds = mask_matrix_nms(
+            masks,
+            cls_labels,
+            cls_scores,
+            mask_area=sum_masks,
+            nms_pre=cfg.nms_pre,
+            max_num=cfg.max_per_img,
+            kernel=cfg.kernel,
+            sigma=cfg.sigma,
+            filter_thr=cfg.filter_thr)
+        # mask_preds = mask_preds[keep_inds]
+        mask_preds = F.interpolate(
+            mask_preds.unsqueeze(0),
+            size=upsampled_size,
+            mode='bilinear',
+            align_corners=False)[:, :, :h, :w]
+        mask_preds = F.interpolate(
+            mask_preds,
+            size=ori_shape[:2],
+            mode='bilinear',
+            align_corners=False).squeeze(0)
+        # masks = mask_preds > cfg.mask_thr
+        masks = mask_preds > 0
+
+        results.masks = masks
+        # results.labels = labels
+        # results.scores = scores
+        results.labels = cls_labels
+        results.scores = cls_scores
+
+        return results
     def _get_results_single(self,
                             kernel_preds,
                             cls_scores,
